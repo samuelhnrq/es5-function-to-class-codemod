@@ -15,30 +15,103 @@ export default function transformer(file, api) {
     );
   }
 
+  // First, collect all function names that have prototype manipulations
+  const functionsWithPrototype = new Set();
+
+  // Find functions that have prototype property assignments
+  root
+    .find(j.MemberExpression, {
+      property: {
+        name: "prototype",
+      },
+    })
+    .forEach((path) => {
+      if (path.value.object && path.value.object.name) {
+        functionsWithPrototype.add(path.value.object.name);
+      }
+    });
+
+  // Find functions that have static method assignments
+  root
+    .find(j.AssignmentExpression, {
+      left: {
+        type: "MemberExpression",
+        property: {
+          type: "Identifier",
+        },
+      },
+      right: {
+        type: "FunctionExpression",
+      },
+    })
+    .forEach((path) => {
+      if (path.value.left.object && path.value.left.object.name) {
+        functionsWithPrototype.add(path.value.left.object.name);
+      }
+    });
+
+  // Find functions that have Object.defineProperty calls
+  root
+    .find(j.CallExpression, {
+      callee: {
+        type: "MemberExpression",
+        object: {
+          type: "Identifier",
+          name: "Object",
+        },
+        property: {
+          type: "Identifier",
+          name: "defineProperty",
+        },
+      },
+    })
+    .forEach((path) => {
+      if (
+        path.value.arguments[0] &&
+        path.value.arguments[0].object &&
+        path.value.arguments[0].object.name
+      ) {
+        functionsWithPrototype.add(path.value.arguments[0].object.name);
+      }
+    });
+
   /*
-    Transform to create Class
+    Transform to create Class - Convert functions that start with uppercase letter
   */
   root
     .find(j.FunctionDeclaration, {
       id: {
-        type: "Identifier"
-      }
+        type: "Identifier",
+      },
     })
-    .forEach(path => {
-      j(path).replaceWith(
-        j.classDeclaration(
-          path.value.id,
-          j.classBody([
-            createMethodDefinition(
-              j,
-              "method",
-              j.identifier("constructor"),
-              path.value
-            )
-          ])
-          // 3rd param => superClass support
-        )
+    .filter((path) => {
+      const functionName = path.value.id.name;
+      // Convert functions that start with uppercase letter
+      return functionName && functionName[0] === functionName[0].toUpperCase();
+    })
+    .forEach((path) => {
+      // Capture any existing comments from the function
+      const functionComments = path.value.comments || [];
+
+      const classDeclaration = j.classDeclaration(
+        path.value.id,
+        j.classBody([
+          createMethodDefinition(
+            j,
+            "method",
+            j.identifier("constructor"),
+            path.value
+          ),
+        ])
+        // 3rd param => superClass support
       );
+
+      // Preserve comments on the class declaration
+      if (functionComments.length > 0) {
+        classDeclaration.comments = functionComments;
+      }
+
+      j(path).replaceWith(classDeclaration);
 
       // Store path for future ref to insert methods
       classPaths[path.value.id.name] = path;
@@ -54,16 +127,16 @@ export default function transformer(file, api) {
           type: "MemberExpression",
           object: {
             property: {
-              name: "prototype"
-            }
-          }
+              name: "prototype",
+            },
+          },
         },
         right: {
-          type: "Literal"
-        }
-      }
+          type: "Literal",
+        },
+      },
     })
-    .forEach(path => {
+    .forEach((path) => {
       const { name: className } = path.value.expression.left.object.object;
       const { name: memberName } = path.value.expression.left.property;
       const { value: memberValue } = path.value.expression.right;
@@ -73,10 +146,10 @@ export default function transformer(file, api) {
         .find(j.MethodDefinition, {
           key: {
             type: "Identifier",
-            name: "constructor"
-          }
+            name: "constructor",
+          },
         })
-        .forEach(path => {
+        .forEach((path) => {
           const { body: constructorBody } = path.value.value.body;
           constructorBody.push(
             j.expressionStatement(
@@ -104,6 +177,15 @@ export default function transformer(file, api) {
     // Fetch previously stored class path to insert methods
     const classPath = classPaths[className];
     const { property: methodName } = path.value.left;
+    console.log(
+      `Adding method ${methodName.name} to class ${className} at ${path}`
+    );
+    if (!classPath) {
+      console.warn(
+        `Class ${className} not found for method ${methodName.name}`
+      );
+      return;
+    }
     const { body: classBody } = classPath.value.body;
     classBody.push(
       createMethodDefinition(
@@ -126,15 +208,15 @@ export default function transformer(file, api) {
         type: "MemberExpression",
         object: {
           property: {
-            name: "prototype"
-          }
-        }
+            name: "prototype",
+          },
+        },
       },
       right: {
-        type: "FunctionExpression"
-      }
+        type: "FunctionExpression",
+      },
     })
-    .forEach(path => addMethodToClass(path, false));
+    .forEach((path) => addMethodToClass(path, false));
 
   /*
     Transform to create "static" class methods
@@ -144,14 +226,22 @@ export default function transformer(file, api) {
       left: {
         type: "MemberExpression",
         property: {
-          type: "Identifier"
-        }
+          type: "Identifier",
+        },
       },
       right: {
-        type: "FunctionExpression"
-      }
+        type: "FunctionExpression",
+      },
     })
-    .forEach(path => addMethodToClass(path, true));
+    .filter((path) => {
+      // filter out exports
+      // e.g. exports.foo = function() {}
+      if (path.value.left.object && path.value.left.object.name === "exports") {
+        return false;
+      }
+      return true;
+    })
+    .forEach((path) => addMethodToClass(path, true));
 
   /*
     Transform for getters, setters
@@ -162,15 +252,15 @@ export default function transformer(file, api) {
         type: "MemberExpression",
         object: {
           type: "Identifier",
-          name: "Object"
+          name: "Object",
         },
         property: {
           type: "Identifier",
-          name: "defineProperty"
-        }
-      }
+          name: "defineProperty",
+        },
+      },
     })
-    .forEach(path => {
+    .forEach((path) => {
       const { name: className } = path.value.arguments[0].object;
       // Fetch previously stored class path to insert methods
       const classPath = classPaths[className];
@@ -178,7 +268,7 @@ export default function transformer(file, api) {
       const { value: methodName } = path.value.arguments[1];
       const { properties } = path.value.arguments[2];
 
-      properties.forEach(property => {
+      properties.forEach((property) => {
         // Type of method => (get || set)
         const { name: type } = property.key;
         classBody.push(
